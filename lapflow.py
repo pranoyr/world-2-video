@@ -369,7 +369,6 @@ class LapFlowDiT(Module):
             outs.append(unpatch(x))
 
         return outs
-        return outs
 
 
 
