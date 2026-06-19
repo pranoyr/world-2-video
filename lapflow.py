@@ -1,16 +1,14 @@
-
 import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import Module
-
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+from torch.amp import autocast
 import einx
 
-
+# --- Helper Functions ---
 
 def pair(t):
     return t if isinstance(t, tuple) else (t, t)
@@ -31,7 +29,14 @@ def down(x): return F.avg_pool3d(x, kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
 def up(x): return F.interpolate(x, scale_factor=(1, 2.0, 2.0), mode='nearest')
 
-# https://arxiv.org/abs/2212.09748
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_emb(x, sin, cos):
+    return (x * cos) + (rotate_half(x) * sin)
+
 
 class TimestepEmbedder(Module):
     def __init__(self, dim):
@@ -42,43 +47,17 @@ class TimestepEmbedder(Module):
             nn.SiLU(),
             nn.Linear(dim, dim)
         )
-
         nn.init.normal_(self.mlp[0].weight, std=0.02)
         nn.init.normal_(self.mlp[2].weight, std=0.02)
 
     def forward(self, t):
         half = self.dim // 2
         freqs = torch.exp(-math.log(10000) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half)
-
         args = (t[:, None].float() * 1000.0) * freqs[None]
-
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.dim % 2:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
         return self.mlp(emb)
-
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size):
-
-    grid_h = torch.arange(grid_size, dtype=torch.float32)
-    grid_w = torch.arange(grid_size, dtype=torch.float32)
-    grid_h, grid_w = torch.meshgrid(grid_h, grid_w, indexing='ij')
-
-    pos_h = grid_h.reshape(-1)
-    pos_w = grid_w.reshape(-1)
-
-    dim_half = embed_dim // 2
-
-    omega = torch.exp(-math.log(10000) * torch.arange(dim_half // 2, dtype=torch.float32) / (dim_half // 2))
-
-    out_h = pos_h[:, None] * omega[None, :]
-    out_w = pos_w[:, None] * omega[None, :]
-
-    emb_h = torch.cat([torch.sin(out_h), torch.cos(out_h)], dim=1)
-    emb_w = torch.cat([torch.sin(out_w), torch.cos(out_w)], dim=1)
-
-    return torch.cat([emb_h, emb_w], dim=1)
-
 
 class AdaLNModulation(Module):
     def __init__(self, dim, out_multiplier=6):
@@ -87,13 +66,11 @@ class AdaLNModulation(Module):
             nn.SiLU(),
             nn.Linear(dim, out_multiplier * dim, bias=True)
         )
-
         nn.init.constant_(self.net[-1].weight, 0)
         nn.init.constant_(self.net[-1].bias, 0)
 
     def forward(self, c):
         return self.net(c)
-
 
 class FeedForward(Module):
     def __init__(self, dim, hidden_dim, dropout = 0.):
@@ -105,11 +82,45 @@ class FeedForward(Module):
             nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout)
         )
-
     def forward(self, x):
         return self.net(x)
 
+class SpatioTemporalAxialRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_freq=10, dim_t=None, dim_spatial=None):
+        super().__init__()
+        self.dim = dim
 
+        if dim_t is None or dim_spatial is None:
+            dim_t = dim // 3
+            dim_t -= (dim_t % 2)  
+            dim_spatial = (dim - dim_t) // 2
+            dim_spatial -= (dim_spatial % 2)
+
+        self.register_buffer('scales_t', torch.linspace(1., max_freq / 2, dim_t // 2))
+        self.register_buffer('scales_spatial', torch.linspace(1., max_freq / 2, dim_spatial // 2))
+
+    @autocast(device_type='cuda', enabled=False)
+    def forward(self, device, dtype, t, n):
+        seq_t = torch.linspace(-1., 1., steps=t, device=device, dtype=dtype).unsqueeze(-1)
+        seq_spatial = torch.linspace(-1., 1., steps=n, device=device, dtype=dtype).unsqueeze(-1)
+
+        seq_t = seq_t * self.scales_t.to(dtype) * math.pi
+        seq_spatial = seq_spatial * self.scales_spatial.to(dtype) * math.pi
+
+        t_sinu = repeat(seq_t, 't d -> t h w d', h=n, w=n)
+        h_sinu = repeat(seq_spatial, 'h d -> t h w d', t=t, w=n) 
+        w_sinu = repeat(seq_spatial, 'w d -> t h w d', t=t, h=n) 
+
+        sin_cat = torch.cat((t_sinu.sin(), h_sinu.sin(), w_sinu.sin()), dim=-1)
+        cos_cat = torch.cat((t_sinu.cos(), h_sinu.cos(), w_sinu.cos()), dim=-1)
+
+        sin = rearrange(sin_cat, 't h w d -> (t h w) d')
+        cos = rearrange(cos_cat, 't h w d -> (t h w) d')
+
+        sin = repeat(sin, 'seq d -> () () seq (j d)', j=2)
+        cos = repeat(cos, 'seq d -> () () seq (j d)', j=2)
+        
+        return sin, cos
 
 class MultiScaleJointAttention(nn.Module):
     def __init__(self, dim, num_scales, context_dim=4096, heads=8, dim_head=64, dropout=0.):
@@ -118,7 +129,6 @@ class MultiScaleJointAttention(nn.Module):
         self.heads = heads
         self.scale = dim_head ** -0.5
         inner_dim = dim_head * heads
-
    
         self.to_qkv = nn.ModuleList([
             nn.Sequential(
@@ -131,20 +141,18 @@ class MultiScaleJointAttention(nn.Module):
             nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
             for _ in range(num_scales)
         ])
-
        
         self.to_qkv_txt = nn.Sequential(
             nn.Linear(context_dim, 3 * inner_dim, bias=False),
             Rearrange('b n (qkv h d) -> qkv b h n d', qkv=3, h=self.heads)
         )
         self.to_out_txt = nn.Sequential(nn.Linear(inner_dim, context_dim), nn.Dropout(dropout))
-
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, xs, context):
+    def forward(self, xs, context, sincos_list):
         device = xs[0].device
         text_len = context.shape[1]
-        lens = [x.shape[1] for x in xs] # Lengths of Coarse, Medium, Fine, etc.
+        lens = [x.shape[1] for x in xs] 
 
         # Project text
         qkv_txt = self.to_qkv_txt(context)
@@ -154,9 +162,16 @@ class MultiScaleJointAttention(nn.Module):
         qkvs = [qkv_layer(x) for qkv_layer, x in zip(self.to_qkv, xs)]
         qs, ks, vs = zip(*qkvs)
         
+        # Apply RoPE to Video Queries and Keys at each scale before concatenation
+        qs_rotated = []
+        ks_rotated = []
+        for q, k, (sin, cos) in zip(qs, ks, sincos_list):
+            qs_rotated.append(apply_rotary_emb(q, sin, cos))
+            ks_rotated.append(apply_rotary_emb(k, sin, cos))
+
         # concat video scales 
-        q_vid = torch.cat(qs, dim=2)
-        k_vid = torch.cat(ks, dim=2)
+        q_vid = torch.cat(qs_rotated, dim=2)
+        k_vid = torch.cat(ks_rotated, dim=2)
         v_vid = torch.cat(vs, dim=2)
 
         # concat for joint attention
@@ -176,7 +191,6 @@ class MultiScaleJointAttention(nn.Module):
         
         total_len = text_len + sum(lens)
         joint_mask = torch.zeros((total_len, total_len), dtype=torch.bool, device=device)
-        
         joint_mask[text_len:, text_len:] = video_causal_mask
 
         # global attention
@@ -199,8 +213,6 @@ class MultiScaleJointAttention(nn.Module):
 
         return vid_outs, txt_out
 
-
-
 class DiTBlock(Module):
     def __init__(self, dim, num_scales, heads, dim_head, mlp_dim, context_dim=4096, dropout=0.):
         super().__init__()
@@ -215,17 +227,13 @@ class DiTBlock(Module):
         self.norm2_txt = nn.LayerNorm(context_dim)
         self.ff_txt = FeedForward(context_dim, context_dim * 4, dropout) 
 
-
         self.joint_attn = MultiScaleJointAttention(dim, num_scales, context_dim, heads, dim_head, dropout)
 
-    def forward(self, xs, c, context):
- 
+    def forward(self, xs, c, context, sincos_list):
         chunks = [adaln(c).chunk(6, dim=-1) for adaln in self.adaln_vid]
-
         msa_inputs = [modulate(norm(x), ch[0], ch[1]) for x, norm, ch in zip(xs, self.norm1_vid, chunks)]
 
-  
-        attn_outs, context_outs = self.joint_attn(msa_inputs, self.norm1_txt(context))
+        attn_outs, context_outs = self.joint_attn(msa_inputs, self.norm1_txt(context), sincos_list)
 
         context = context + context_outs
         context = context + self.ff_txt(self.norm2_txt(context))
@@ -240,23 +248,6 @@ class DiTBlock(Module):
 
         return outs, context
 
-
-class SinusoidalPosEmb(Module):
-    def __init__(self, dim, theta = 10000):
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(self.theta) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = einx.multiply('i, j -> i j', x, emb)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
 class LabelEmbedder(nn.Module):
     def __init__(self, num_classes, hidden_size):
         super().__init__()
@@ -267,7 +258,6 @@ class LabelEmbedder(nn.Module):
         labels = labels.long()
         labels = torch.where(labels < 0, self.num_classes, labels)
         return self.embedding_table(labels)
-
 
 class LapFlowDiT(Module):
     def __init__(
@@ -309,9 +299,9 @@ class LapFlowDiT(Module):
             ) for _ in range(num_scales)
         ])
 
-        self.pos_embeds = nn.ParameterList([
-            nn.Parameter(get_2d_sincos_pos_embed(dim, g).clone().detach(), requires_grad=False)
-            for g in grids
+        # RoPE operates on dim_head, so we instantiate it for each scale
+        self.pos_embeds = nn.ModuleList([
+            SpatioTemporalAxialRotaryEmbedding(dim=dim_head) for _ in range(num_scales)
         ])
 
         self.final_adalns = nn.ModuleList([AdaLNModulation(dim, out_multiplier=2) for _ in range(num_scales)])
@@ -343,9 +333,19 @@ class LapFlowDiT(Module):
 
     def forward(self, imgs_list, times, cond=None):
         xs = []
+        sincos_list = []
+        
         for img, patch_embed, pos_embed in zip(imgs_list, self.patch_embeds, self.pos_embeds):
-            x = patch_embed(img)
-            x = x + pos_embed
+            x = patch_embed(img) # Shape: [b, t, n, d] where n = h*w
+            
+            # Extract dynamically to build RoPE frequencies
+            b, t, n, _ = x.shape
+            grid_size = int(math.sqrt(n)) 
+            
+            # Generate Sin/Cos frequencies for this scale
+            sin, cos = pos_embed(x.device, x.dtype, t, grid_size)
+            sincos_list.append((sin, cos))
+            
             x = rearrange(x, 'b t n d -> b (t n) d')
             xs.append(self.dropout(x))
 
@@ -357,7 +357,7 @@ class LapFlowDiT(Module):
             context = context.unsqueeze(1)
 
         for block in self.blocks:
-            xs, context = block(xs, c, context)
+            xs, context = block(xs, c, context, sincos_list)
 
         outs = []
         for x, adaln, norm, linear, unpatch in zip(
@@ -369,7 +369,6 @@ class LapFlowDiT(Module):
             outs.append(unpatch(x))
 
         return outs
-
 
 
 class LapFlow(Module):
