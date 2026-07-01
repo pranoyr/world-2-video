@@ -106,7 +106,7 @@ lap_flow = LapFlow(
     model=model,
     normalize_data_fn=lambda t: (t * 2) - 1,
     unnormalize_data_fn=lambda t: (t + 1) * 0.5,
-    cfg_scale=3.0,
+    cfg_scale=1,
     vae=vae,
     vae_scale_factor=vae_scale_factor
 ).to(device)

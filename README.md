@@ -12,4 +12,4 @@ python train_w2v.py
 
 Trained using Moving MNIST:
 
-![Results at 123000 iteration](results/results.123000.gif)
+<img src="results/results.123000.gif" width="450" alt="Results at 123000 iteration" />

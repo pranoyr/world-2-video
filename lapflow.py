@@ -8,7 +8,7 @@ from einops.layers.torch import Rearrange
 from torch.amp import autocast
 import einx
 
-# --- Helper Functions ---
+
 
 def pair(t):
     return t if isinstance(t, tuple) else (t, t)
@@ -299,7 +299,6 @@ class LapFlowDiT(Module):
             ) for _ in range(num_scales)
         ])
 
-        # RoPE operates on dim_head, so we instantiate it for each scale
         self.pos_embeds = nn.ModuleList([
             SpatioTemporalAxialRotaryEmbedding(dim=dim_head) for _ in range(num_scales)
         ])
